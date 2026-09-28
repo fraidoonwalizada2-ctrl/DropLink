@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function() {
+        try {
+          var saved = localStorage.getItem('droplink_theme');
+          var theme = saved ? JSON.parse(saved) : 'dark';
+          if (theme === 'dark') {
+            document.documentElement.classList.add('dark');
+            document.documentElement.classList.remove('light');
+          } else {
+            document.documentElement.classList.remove('dark');
+            document.documentElement.classList.add('light');
+          }
+        } catch (e) {
+          document.documentElement.classList.add('dark');
+        }
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes" />
+    <meta name="theme-color" content="#090d16" />
+
+    <!-- SEO Primary Metadata -->
+    <title>DropLink — Move Anything. Anywhere.</title>
+    <meta name="title" content="DropLink — Move Anything. Anywhere." />
+    <meta name="description" content="Transfer files between your devices quickly and privately using your browser." />
+    <meta name="keywords" content="file transfer, WebRTC, peer to peer, device transfer, drop file, share file, mobile computer transfer" />
+    <meta name="author" content="DropLink" />
+
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://droplink.app/" />
+    <meta property="og:title" content="DropLink — Move Anything. Anywhere." />
+    <meta property="og:description" content="Transfer files between your devices quickly and privately using your browser." />
+
+    <!-- Twitter -->
+    <meta property="twitter:card" content="summary_large_image" />
+    <meta property="twitter:title" content="DropLink — Move Anything. Anywhere." />
+    <meta property="twitter:description" content="Transfer files between your devices quickly and privately using your browser." />
+  </head>
+  <body class="bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 antialiased selection:bg-sky-500 selection:text-white">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
