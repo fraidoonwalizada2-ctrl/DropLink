@@ -14,6 +14,7 @@ export class SignalingService {
 
   private getSocketUrl(): string {
     const envUrl = import.meta.env.VITE_SIGNALING_SERVER_URL;
+    const defaultProductionUrl = 'wss://droplink-signaling.fraidoonwalizada2.workers.dev';
 
     if (typeof window !== 'undefined') {
       const isLocalhost =
@@ -25,6 +26,16 @@ export class SignalingService {
         return envUrl;
       }
 
+      // Check if running on local private network IP (e.g. 192.168.x.x)
+      const isLocalNetwork = window.location.hostname.match(
+        /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/
+      );
+
+      // In public production (e.g. droplink-app.vercel.app or custom domain), use the production signaling server
+      if (!isLocalhost && !isLocalNetwork) {
+        return envUrl || defaultProductionUrl;
+      }
+
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       
       // On mobile or local network (e.g. http://192.168.x.x:5173 or http://10.x.x.x:5173):
@@ -32,7 +43,7 @@ export class SignalingService {
       return `${protocol}//${window.location.host}/ws`;
     }
 
-    return envUrl || 'ws://127.0.0.1:3001';
+    return envUrl || defaultProductionUrl;
   }
 
   public connect(): Promise<boolean> {

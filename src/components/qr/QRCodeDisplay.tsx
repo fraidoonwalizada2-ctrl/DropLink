@@ -79,7 +79,7 @@ export const QRCodeDisplay: React.FC<QRCodeDisplayProps> = ({
           level="H"
           includeMargin={true}
           imageSettings={{
-            src: '/favicon.ico',
+            src: '/favicon.svg',
             x: undefined,
             y: undefined,
             height: 32,

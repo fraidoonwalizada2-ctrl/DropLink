@@ -5,8 +5,8 @@ import { roomService } from '@/services/room.service';
 import { signalingService } from '@/services/signaling.service';
 import { getLocalDeviceInfo } from '@/utils/deviceInfo';
 
-export function useRoom(initialRoomId?: string) {
-  const [room, setRoom] = useState<Room | null>(null);
+export function useRoom(initialRoomId?: string, initialRoom?: Room | null) {
+  const [room, setRoom] = useState<Room | null>(initialRoom || null);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [errorType, setErrorType] = useState<string | null>(null);

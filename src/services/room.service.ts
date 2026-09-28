@@ -16,9 +16,26 @@ class RoomService {
    * Helper to format real share URL for a room code
    */
   public getRoomShareUrl(roomId: string): string {
-    if (typeof window === 'undefined') return `https://droplink.app/join/${roomId.toUpperCase()}`;
-    const origin = window.location.origin;
-    return `${origin}/join/${roomId.toUpperCase()}`;
+    const cleanId = (roomId || '').trim().toUpperCase();
+    if (typeof window === 'undefined') {
+      const fallback = import.meta.env.VITE_APP_URL || 'https://droplink-app.vercel.app';
+      return `${fallback.replace(/\/+$/, '')}/join/${cleanId}`;
+    }
+
+    let origin = window.location.origin;
+
+    // In local development, if VITE_APP_URL is explicitly set to an IP or custom domain, use it
+    const envAppUrl = import.meta.env.VITE_APP_URL;
+    if (
+      envAppUrl &&
+      (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') &&
+      !envAppUrl.includes('localhost') &&
+      !envAppUrl.includes('127.0.0.1')
+    ) {
+      origin = envAppUrl.replace(/\/+$/, '');
+    }
+
+    return `${origin}/join/${cleanId}`;
   }
 
   /**

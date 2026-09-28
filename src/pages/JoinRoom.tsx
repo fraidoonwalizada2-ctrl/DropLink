@@ -30,7 +30,7 @@ export const JoinRoom: React.FC = () => {
     }
     const joinedRoom = await joinExistingRoom(cleanCode);
     if (joinedRoom) {
-      navigate(`/room/${cleanCode}`);
+      navigate(`/room/${cleanCode}`, { state: { room: joinedRoom } });
     }
   };
 
@@ -63,7 +63,9 @@ export const JoinRoom: React.FC = () => {
             Join a Transfer Room
           </h1>
           <p className="text-base text-slate-600 dark:text-slate-400 max-w-md mx-auto leading-relaxed">
-            Enter a 6-character room code or scan the QR code displayed on the host device.
+            {urlRoomId && loading
+              ? `Connecting to room ${urlRoomId.toUpperCase()}...`
+              : 'Enter a 6-character room code or scan the QR code displayed on the host device.'}
           </p>
         </div>
 

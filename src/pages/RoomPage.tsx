@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Share2,
@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   Wifi,
 } from 'lucide-react';
+import type { Room } from '@/types/room';
 import { useRoom } from '@/hooks/useRoom';
 import { useWebRTC } from '@/hooks/useWebRTC';
 import { useTransfer } from '@/hooks/useTransfer';
@@ -30,6 +31,8 @@ import { roomService } from '@/services/room.service';
 export const RoomPage: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+  const initialRoom = (location.state as { room?: Room } | undefined)?.room || null;
   const cleanRoomId = (roomId || '').toUpperCase();
 
   const {
@@ -40,7 +43,7 @@ export const RoomPage: React.FC = () => {
     joinExistingRoom,
     leaveCurrentRoom,
     closeCurrentRoom,
-  } = useRoom(cleanRoomId);
+  } = useRoom(cleanRoomId, initialRoom);
 
   // WebRTC P2P Peer Connection hook
   const { p2pState, isP2PConnected } = useWebRTC(room);
