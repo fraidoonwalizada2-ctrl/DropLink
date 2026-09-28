@@ -18,7 +18,8 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  if (req.url === '/health' || req.url === '/') {
+  const urlPath = req.url ? req.url.split('?')[0] : '';
+  if (urlPath === '/health' || urlPath === '/') {
     res.writeHead(200);
     res.end(
       JSON.stringify({
@@ -311,7 +312,6 @@ function handleClientLeave(ws: WebSocket, roomId: string, deviceId: string) {
 // Start HTTP & WebSocket server
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`=================================================`);
-  console.log(`🚀 DropLink Real-Time Server running on port ${PORT}`);
-  console.log(`   WebSocket URL: ws://localhost:${PORT}`);
+  console.log(`DropLink Signaling Server running on port ${PORT}`);
   console.log(`=================================================`);
 });
