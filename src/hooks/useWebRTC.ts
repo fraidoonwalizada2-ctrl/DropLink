@@ -7,18 +7,37 @@ import { getLocalDeviceInfo } from '@/utils/deviceInfo';
 
 export function useWebRTC(room: Room | null) {
   const [p2pState, setP2pState] = useState<P2PConnectionState>(webRTCService.getConnectionState());
+  const [connectionType, setConnectionType] = useState<'DIRECT' | 'STUN' | 'TURN RELAY' | null>(
+    webRTCService.getSelectedConnectionType()
+  );
+  const [failureMessage, setFailureMessage] = useState<string | null>(null);
   const localDevice = getLocalDeviceInfo();
   const hasInitiatedRef = useRef(false);
 
   useEffect(() => {
     const handleStateChange = (data: { state: P2PConnectionState }) => {
       setP2pState(data.state);
+      if (data.state === 'connected') {
+        setFailureMessage(null);
+      }
+    };
+
+    const handleTypeDetected = (data: { connectionType: 'DIRECT' | 'STUN' | 'TURN RELAY' }) => {
+      setConnectionType(data.connectionType);
+    };
+
+    const handleFailed = (data: { message?: string }) => {
+      setFailureMessage(data.message || 'Could not establish a direct connection. Please check your network or try again.');
     };
 
     webRTCService.on('connection-state-change', handleStateChange);
+    webRTCService.on('connection-type-detected', handleTypeDetected);
+    webRTCService.on('connection-failed', handleFailed);
 
     return () => {
       webRTCService.off('connection-state-change', handleStateChange);
+      webRTCService.off('connection-type-detected', handleTypeDetected);
+      webRTCService.off('connection-failed', handleFailed);
     };
   }, []);
 
@@ -80,5 +99,7 @@ export function useWebRTC(room: Room | null) {
   return {
     p2pState,
     isP2PConnected: p2pState === 'connected',
+    connectionType,
+    failureMessage,
   };
 }

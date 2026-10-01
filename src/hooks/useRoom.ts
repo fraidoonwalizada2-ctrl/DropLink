@@ -57,14 +57,23 @@ export function useRoom(initialRoomId?: string, initialRoom?: Room | null) {
       setError('This transfer room has expired.');
     };
 
+    const handleRoomJoined = (msg: ServerMessage) => {
+      const { room: updatedRoom } = msg.payload || {};
+      if (updatedRoom) {
+        setRoom(updatedRoom);
+      }
+    };
+
     signalingService.on('device-joined', handleDeviceJoined);
     signalingService.on('device-left', handleDeviceLeft);
+    signalingService.on('room-joined', handleRoomJoined);
     signalingService.on('room-closed', handleRoomClosed);
     signalingService.on('room-expired', handleRoomExpired);
 
     return () => {
       signalingService.off('device-joined', handleDeviceJoined);
       signalingService.off('device-left', handleDeviceLeft);
+      signalingService.off('room-joined', handleRoomJoined);
       signalingService.off('room-closed', handleRoomClosed);
       signalingService.off('room-expired', handleRoomExpired);
     };

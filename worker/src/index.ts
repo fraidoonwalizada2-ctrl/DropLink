@@ -42,10 +42,9 @@ export default {
 
     // WebSocket Upgrade routing to Durable Object
     if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-      // Connect to unified room hub (or query-specified room if provided)
-      const roomParam = url.searchParams.get('room');
-      const doName = roomParam ? roomParam.trim().toUpperCase() : 'default';
-      const doId = env.SIGNALING_ROOM.idFromName(doName);
+      // Connect to unified room hub (droplink-global-hub)
+      // All clients must share the same Durable Object instance so rooms can be created and joined reliably
+      const doId = env.SIGNALING_ROOM.idFromName('droplink-global-hub');
       const stub = env.SIGNALING_ROOM.get(doId);
 
       return stub.fetch(request);

@@ -278,11 +278,29 @@ wss.on('connection', (ws: WebSocket, req) => {
   ws.on('close', () => {
     const meta = socketMetaMap.get(ws);
     if (meta && meta.roomId && meta.deviceId) {
-      handleClientLeave(ws, meta.roomId, meta.deviceId);
+      handleSocketDisconnect(ws, meta.roomId, meta.deviceId);
     }
     console.log('[WebSocket] Client disconnected');
   });
 });
+
+function handleSocketDisconnect(ws: WebSocket, roomId: string, deviceId: string) {
+  unregisterSocketFromRoom(roomId, ws);
+
+  const result = roomManager.markDeviceDisconnected(roomId, deviceId);
+  if (!result || !result.room) return;
+
+  console.log(`[Room] Device ${deviceId} disconnected from room ${roomId}. Room preserved.`);
+
+  // Inform other device in room of temporary disconnect
+  broadcastToRoom(roomId, {
+    type: 'device-left',
+    payload: {
+      deviceId,
+      room: roomManager.formatRoomForClient(result.room, result.room.hostDeviceId),
+    },
+  });
+}
 
 function handleClientLeave(ws: WebSocket, roomId: string, deviceId: string) {
   unregisterSocketFromRoom(roomId, ws);
@@ -290,15 +308,9 @@ function handleClientLeave(ws: WebSocket, roomId: string, deviceId: string) {
   const result = roomManager.leaveRoom(roomId, deviceId);
   if (!result) return;
 
-  if (result.isHostLeft || result.remainingDevicesCount === 0) {
-    // Room closed because host left
-    broadcastToRoom(roomId, {
-      type: 'room-closed',
-      payload: { roomId, reason: 'Host device disconnected' },
-    });
+  if (result.remainingDevicesCount === 0) {
     roomSocketsMap.delete(roomId);
   } else if (result.room) {
-    // Regular peer left
     broadcastToRoom(roomId, {
       type: 'device-left',
       payload: {

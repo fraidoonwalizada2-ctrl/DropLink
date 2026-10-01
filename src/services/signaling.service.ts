@@ -11,8 +11,18 @@ export class SignalingService {
   private connectPromise: Promise<boolean> | null = null;
   private pendingRequests = new Map<string, { resolve: (val: any) => void; reject: (err: any) => void }>();
   private pingInterval: any = null;
+  private messageQueue: ClientMessage[] = [];
 
-  private getSocketUrl(): string {
+  // Room tracking & auto-reconnect state
+  private currentRoomId: string | null = null;
+  private currentDevice: Device | null = null;
+  private reconnectAttempts = 0;
+  private readonly maxReconnectAttempts = 5;
+  private reconnectTimer: any = null;
+  private isReconnecting = false;
+  private isExplicitDisconnect = false;
+
+  private getSocketUrls(): { primaryUrl: string; fallbackUrl?: string } {
     const envUrl = import.meta.env.VITE_SIGNALING_SERVER_URL;
     const defaultProductionUrl = 'wss://droplink-signaling.fraidoonwalizada2.workers.dev';
 
@@ -21,29 +31,34 @@ export class SignalingService {
         window.location.hostname === 'localhost' ||
         window.location.hostname === '127.0.0.1';
 
-      // If an explicit remote URL is set in env (e.g. wss://... in production), use it
-      if (envUrl && (!envUrl.includes('localhost') && !envUrl.includes('127.0.0.1') || isLocalhost)) {
-        return envUrl;
-      }
-
-      // Check if running on local private network IP (e.g. 192.168.x.x)
-      const isLocalNetwork = window.location.hostname.match(
-        /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/
+      const isLocalNetwork = Boolean(
+        window.location.hostname.match(
+          /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)/
+        )
       );
 
-      // In public production (e.g. droplink-app.vercel.app or custom domain), use the production signaling server
-      if (!isLocalhost && !isLocalNetwork) {
-        return envUrl || defaultProductionUrl;
+      // Local development or private LAN
+      if (isLocalhost || isLocalNetwork) {
+        if (envUrl) {
+          return { primaryUrl: envUrl, fallbackUrl: 'ws://127.0.0.1:3001' };
+        }
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        return {
+          primaryUrl: `${protocol}//${window.location.host}/ws`,
+          fallbackUrl: `${protocol}//${window.location.hostname}:3001`,
+        };
       }
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      
-      // On mobile or local network (e.g. http://192.168.x.x:5173 or http://10.x.x.x:5173):
-      // Use Vite proxy path /ws on the same port so mobile devices don't need port 3001 open on desktop firewall
-      return `${protocol}//${window.location.host}/ws`;
+      // In production (Vercel or custom domain):
+      // NEVER fallback to port 3001 on the public hostname!
+      const prodUrl = envUrl || defaultProductionUrl;
+      return {
+        primaryUrl: prodUrl,
+        fallbackUrl: envUrl && envUrl !== defaultProductionUrl ? defaultProductionUrl : undefined,
+      };
     }
 
-    return envUrl || defaultProductionUrl;
+    return { primaryUrl: envUrl || defaultProductionUrl };
   }
 
   public connect(): Promise<boolean> {
@@ -54,10 +69,8 @@ export class SignalingService {
       return this.connectPromise;
     }
 
-    const primaryUrl = this.getSocketUrl();
-    const fallbackUrl = typeof window !== 'undefined'
-      ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.hostname}:3001`
-      : 'ws://127.0.0.1:3001';
+    this.isExplicitDisconnect = false;
+    const { primaryUrl, fallbackUrl } = this.getSocketUrls();
 
     const tryConnect = (url: string, isFallback: boolean): Promise<boolean> => {
       return new Promise((resolve) => {
@@ -69,7 +82,14 @@ export class SignalingService {
             console.log(`[SignalingService] WebSocket connected successfully to ${url}`);
             this.isConnected = true;
             this.connectPromise = null;
+            this.reconnectAttempts = 0;
+            this.isReconnecting = false;
+            this.flushMessageQueue();
             this.startHeartbeat();
+            this.emit('connection-status', {
+              type: 'connection-status',
+              payload: { status: 'connected' },
+            });
             resolve(true);
           };
 
@@ -84,7 +104,7 @@ export class SignalingService {
 
           this.socket.onerror = async (err) => {
             console.warn(`[SignalingService] WebSocket error on ${url}:`, err);
-            if (!isFallback && primaryUrl !== fallbackUrl) {
+            if (!isFallback && fallbackUrl && primaryUrl !== fallbackUrl) {
               console.log(`[SignalingService] Attempting fallback to ${fallbackUrl}...`);
               const fallbackSuccess = await tryConnect(fallbackUrl, true);
               resolve(fallbackSuccess);
@@ -95,19 +115,23 @@ export class SignalingService {
             }
           };
 
-          this.socket.onclose = () => {
-            console.log('[SignalingService] WebSocket connection closed');
+          this.socket.onclose = (event) => {
+            console.log(`[SignalingService] WebSocket connection closed (code: ${event.code}, reason: ${event.reason || 'none'})`);
             this.isConnected = false;
             this.connectPromise = null;
             this.stopHeartbeat();
             this.emit('connection-status', {
               type: 'connection-status',
-              payload: { errorType: 'CONNECTION_LOST', errorMessage: 'Lost connection to signaling server.' },
+              payload: { status: 'disconnected', errorType: 'CONNECTION_LOST', errorMessage: 'Lost connection to signaling server.' },
             });
+
+            if (!this.isExplicitDisconnect) {
+              this.scheduleReconnect();
+            }
           };
         } catch (err) {
           console.error('[SignalingService] Connection attempt failed:', err);
-          if (!isFallback && primaryUrl !== fallbackUrl) {
+          if (!isFallback && fallbackUrl && primaryUrl !== fallbackUrl) {
             tryConnect(fallbackUrl, true).then(resolve);
           } else {
             this.isConnected = false;
@@ -122,22 +146,75 @@ export class SignalingService {
     return this.connectPromise;
   }
 
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || this.isExplicitDisconnect) return;
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.warn(`[SignalingService] Max reconnect attempts (${this.maxReconnectAttempts}) reached.`);
+      return;
+    }
+
+    this.reconnectAttempts++;
+    const delay = Math.min(this.reconnectAttempts * 1000, 5000);
+    console.log(`[SignalingService] Scheduling reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms...`);
+    this.isReconnecting = true;
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.isExplicitDisconnect) return;
+
+      console.log(`[SignalingService] Executing reconnect attempt ${this.reconnectAttempts}...`);
+      const success = await this.connect();
+      if (success) {
+        console.log(`[SignalingService] Reconnection successful.`);
+        this.isReconnecting = false;
+        this.reconnectAttempts = 0;
+
+        // Auto-rejoin active room if user was in a room
+        if (this.currentRoomId && this.currentDevice) {
+          console.log(`[SignalingService] Auto-rejoining room ${this.currentRoomId} following reconnection...`);
+          try {
+            const rejoinResult = await this.joinRoomOnServer(this.currentRoomId, this.currentDevice);
+            if (rejoinResult.success && rejoinResult.room) {
+              console.log(`[SignalingService] Successfully auto-rejoined room ${this.currentRoomId}`);
+              this.emit('room-joined', {
+                type: 'room-joined',
+                payload: { room: rejoinResult.room },
+              });
+            }
+          } catch (e) {
+            console.error(`[SignalingService] Auto-rejoin failed:`, e);
+          }
+        }
+      } else {
+        this.scheduleReconnect();
+      }
+    }, delay);
+  }
+
   public disconnect(): void {
+    this.isExplicitDisconnect = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.stopHeartbeat();
     if (this.socket) {
       this.socket.close();
       this.socket = null;
     }
     this.isConnected = false;
+    this.connectPromise = null;
   }
 
   public async createRoomOnServer(device: Device): Promise<{ success: boolean; room?: Room; error?: string; errorType?: string }> {
+    console.log(`[Room] Creating room for device: ${device.name} (${device.id})`);
     const connected = await this.connect();
     if (!connected) {
+      console.warn(`[Room] Connection failed when attempting to create room`);
       return {
         success: false,
         errorType: 'SERVER_UNAVAILABLE',
-        error: 'Unable to connect to DropLink signaling server. Make sure server is running on port 3001.',
+        error: 'Unable to connect to DropLink signaling server. Check your network connection.',
       };
     }
 
@@ -150,8 +227,20 @@ export class SignalingService {
 
     return new Promise((resolve) => {
       this.pendingRequests.set(requestId, {
-        resolve: (data) => resolve({ success: true, room: data.room }),
-        reject: (err) => resolve({ success: false, errorType: err.errorType, error: err.errorMessage }),
+        resolve: (data) => {
+          if (data?.room?.id) {
+            this.currentRoomId = data.room.id;
+            this.currentDevice = device;
+            console.log(`[Room] Created: ${data.room.id}`);
+            const origin = typeof window !== 'undefined' ? window.location.origin : 'https://droplink-app.vercel.app';
+            console.log(`[Room] QR URL: ${origin}/join/${data.room.id}`);
+          }
+          resolve({ success: true, room: data.room });
+        },
+        reject: (err) => {
+          console.warn(`[Room] Create rejected:`, err);
+          resolve({ success: false, errorType: err.errorType, error: err.errorMessage });
+        },
       });
 
       this.sendRaw(msg);
@@ -161,31 +250,49 @@ export class SignalingService {
           this.pendingRequests.delete(requestId);
           resolve({ success: false, errorType: 'TIMEOUT', error: 'Server response timed out.' });
         }
-      }, 8000);
+      }, 10000);
     });
   }
 
   public async joinRoomOnServer(roomCode: string, device: Device): Promise<{ success: boolean; room?: Room; error?: string; errorType?: string }> {
+    const cleanCode = (roomCode || '').trim().toUpperCase();
+    console.log(`[Room] Joining room: ${cleanCode}`);
+
     const connected = await this.connect();
+    const wsState = this.socket
+      ? ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'][this.socket.readyState] || 'UNKNOWN'
+      : 'NULL';
+    console.log(`[Room] WebSocket state: ${wsState}`);
+
     if (!connected) {
+      console.warn(`[Room] JOIN rejected reason: SERVER_UNAVAILABLE`);
       return {
         success: false,
         errorType: 'SERVER_UNAVAILABLE',
-        error: 'Unable to connect to DropLink signaling server. Make sure server is running on port 3001.',
+        error: 'Unable to connect to DropLink signaling server. Check your network connection.',
       };
     }
 
+    console.log(`[Room] Sending JOIN: ${cleanCode}`);
     const requestId = 'req_' + Math.random().toString(36).substring(2, 9);
     const msg: ClientMessage = {
       type: 'join-room',
-      payload: { roomCode, device },
+      payload: { roomCode: cleanCode, device },
       requestId,
     };
 
     return new Promise((resolve) => {
       this.pendingRequests.set(requestId, {
-        resolve: (data) => resolve({ success: true, room: data.room }),
-        reject: (err) => resolve({ success: false, errorType: err.errorType, error: err.errorMessage }),
+        resolve: (data) => {
+          console.log(`[Room] JOIN accepted: ${cleanCode}`);
+          this.currentRoomId = cleanCode;
+          this.currentDevice = device;
+          resolve({ success: true, room: data.room });
+        },
+        reject: (err) => {
+          console.warn(`[Room] JOIN rejected reason: ${err.errorType || 'ERROR'} - ${err.errorMessage || err}`);
+          resolve({ success: false, errorType: err.errorType, error: err.errorMessage });
+        },
       });
 
       this.sendRaw(msg);
@@ -193,28 +300,31 @@ export class SignalingService {
       setTimeout(() => {
         if (this.pendingRequests.has(requestId)) {
           this.pendingRequests.delete(requestId);
+          console.warn(`[Room] JOIN rejected reason: TIMEOUT`);
           resolve({ success: false, errorType: 'TIMEOUT', error: 'Server response timed out.' });
         }
-      }, 8000);
+      }, 10000);
     });
   }
 
   public leaveRoomOnServer(roomId: string, deviceId: string): void {
-    if (this.isConnected && this.socket?.readyState === WebSocket.OPEN) {
-      this.sendRaw({
-        type: 'leave-room',
-        payload: { roomId, deviceId },
-      });
+    if (this.currentRoomId === roomId.trim().toUpperCase()) {
+      this.currentRoomId = null;
     }
+    this.sendRaw({
+      type: 'leave-room',
+      payload: { roomId, deviceId },
+    });
   }
 
   public closeRoomOnServer(roomId: string, deviceId: string): void {
-    if (this.isConnected && this.socket?.readyState === WebSocket.OPEN) {
-      this.sendRaw({
-        type: 'close-room',
-        payload: { roomId, deviceId },
-      });
+    if (this.currentRoomId === roomId.trim().toUpperCase()) {
+      this.currentRoomId = null;
     }
+    this.sendRaw({
+      type: 'close-room',
+      payload: { roomId, deviceId },
+    });
   }
 
   // WebRTC Signaling Relay Methods
@@ -242,6 +352,21 @@ export class SignalingService {
   private sendRaw(msg: ClientMessage): void {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify(msg));
+    } else {
+      console.log(`[SignalingService] Socket not ready (state: ${this.socket?.readyState ?? 'null'}), queuing message:`, msg.type);
+      this.messageQueue.push(msg);
+      this.connect();
+    }
+  }
+
+  private flushMessageQueue(): void {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN && this.messageQueue.length > 0) {
+      console.log(`[SignalingService] Flushing ${this.messageQueue.length} queued messages`);
+      const queue = [...this.messageQueue];
+      this.messageQueue = [];
+      for (const msg of queue) {
+        this.socket.send(JSON.stringify(msg));
+      }
     }
   }
 
@@ -300,6 +425,14 @@ export class SignalingService {
 
   public getIsConnected(): boolean {
     return this.isConnected;
+  }
+
+  public getIsReconnecting(): boolean {
+    return this.isReconnecting;
+  }
+
+  public getCurrentRoomId(): string | null {
+    return this.currentRoomId;
   }
 }
 

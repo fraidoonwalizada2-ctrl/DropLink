@@ -27,6 +27,7 @@ import { TransferCard } from '@/components/transfer/TransferCard';
 import { EmptyTransferState } from '@/components/transfer/EmptyTransferState';
 import { Modal } from '@/components/common/Modal';
 import { roomService } from '@/services/room.service';
+import { getLocalDeviceInfo } from '@/utils/deviceInfo';
 
 export const RoomPage: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
@@ -77,8 +78,11 @@ export const RoomPage: React.FC = () => {
     }
   }, [cleanRoomId, room, loading, error, joinExistingRoom]);
 
+  const localDevice = getLocalDeviceInfo();
+  const isHost = room ? room.hostDeviceId === localDevice.id : false;
+
   const handleLeaveOrClose = () => {
-    if (room?.connectedDevices?.[0]?.isSelf) {
+    if (isHost) {
       closeCurrentRoom();
     } else {
       leaveCurrentRoom();
@@ -173,9 +177,9 @@ export const RoomPage: React.FC = () => {
       {p2pState === 'failed' && (
         <AlertBanner
           type="warning"
-          title="Direct P2P Connection Blocked"
-          message="A direct WebRTC peer connection could not be established. This usually happens under restrictive corporate firewalls or symmetric NATs that require a TURN relay server."
-          actionHint="Configure VITE_TURN_SERVER_URL in .env if testing across restrictive firewalls."
+          title="Connection Notice"
+          message="Could not establish a direct connection. Please check your network or try again."
+          actionHint="Both devices must be online or configured with TURN relay."
           className="mb-4"
         />
       )}
@@ -263,7 +267,7 @@ export const RoomPage: React.FC = () => {
             className="text-red-600 dark:text-red-400 hover:bg-red-500/10 hover:text-red-700 dark:hover:text-red-300"
             icon={<LogOut className="w-4 h-4" />}
           >
-            Leave Room
+            {isHost ? 'Close Room' : 'Leave Room'}
           </Button>
         </div>
       </motion.div>

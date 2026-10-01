@@ -90,8 +90,10 @@ export class RoomManager {
       };
     }
 
+    const isExistingMember = room.devices.has(joiningDevice.id);
+
     // Check capacity if device is not already in the room
-    if (!room.devices.has(joiningDevice.id) && room.devices.size >= room.maxDevices) {
+    if (!isExistingMember && room.devices.size >= room.maxDevices) {
       return {
         success: false,
         errorType: 'ROOM_FULL',
@@ -99,11 +101,12 @@ export class RoomManager {
       };
     }
 
-    // Add device
+    // Add or reconnect device
+    const existingDev = room.devices.get(joiningDevice.id);
     const deviceWithStatus: DeviceInfo = {
       ...joiningDevice,
       status: 'connected',
-      joinedAt: now,
+      joinedAt: existingDev?.joinedAt || now,
     };
 
     room.devices.set(joiningDevice.id, deviceWithStatus);
@@ -124,7 +127,27 @@ export class RoomManager {
   }
 
   /**
-   * Handle device disconnect / leave
+   * Handle temporary socket disconnection without destroying room
+   */
+  public markDeviceDisconnected(
+    code: string,
+    deviceId: string
+  ): { room?: RoomRecord; isHost: boolean } | null {
+    const cleanCode = code.trim().toUpperCase();
+    const room = this.rooms.get(cleanCode);
+    if (!room) return null;
+
+    const dev = room.devices.get(deviceId);
+    if (dev) {
+      dev.status = 'disconnected';
+    }
+    room.lastActivityAt = Date.now();
+
+    return { room, isHost: room.hostDeviceId === deviceId };
+  }
+
+  /**
+   * Handle explicit device leave
    */
   public leaveRoom(
     code: string,
@@ -142,16 +165,16 @@ export class RoomManager {
       room.status = 'waiting';
     }
 
-    if (room.devices.size === 0 || isHostLeft) {
+    if (room.devices.size === 0) {
       this.closeRoom(cleanCode);
       return { room, isHostLeft, remainingDevicesCount: 0 };
     }
 
-    return { room, isHostLeft: false, remainingDevicesCount: room.devices.size };
+    return { room, isHostLeft, remainingDevicesCount: room.devices.size };
   }
 
   /**
-   * Close and destroy a room
+   * Close and destroy a room (explicit host close or expiry)
    */
   public closeRoom(code: string): boolean {
     const cleanCode = code.trim().toUpperCase();

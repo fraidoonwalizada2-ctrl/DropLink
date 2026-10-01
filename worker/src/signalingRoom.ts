@@ -20,6 +20,23 @@ export class SignalingRoom extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+
+    // Initialize in-memory rooms from persistent SQLite storage across hibernation / restarts
+    this.ctx.blockConcurrencyWhile(async () => {
+      try {
+        const storedRooms = await this.ctx.storage.list<RoomRecord>({ prefix: 'room:' });
+        const now = Date.now();
+        for (const [storageKey, room] of storedRooms) {
+          if (now > room.expiresAt || now - room.lastActivityAt > this.INACTIVITY_TIMEOUT_MS) {
+            await this.ctx.storage.delete(storageKey);
+          } else {
+            this.rooms.set(room.id, room);
+          }
+        }
+      } catch (err) {
+        console.error('[SignalingRoom] Failed to restore rooms from storage:', err);
+      }
+    });
   }
 
   /**
@@ -54,7 +71,7 @@ export class SignalingRoom extends DurableObject<Env> {
    */
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     try {
-      this.cleanupStaleRooms();
+      await this.cleanupStaleRooms();
 
       const msgStr = typeof message === 'string' ? message : new TextDecoder().decode(message);
       const parsed: ClientMessage = JSON.parse(msgStr);
@@ -67,12 +84,58 @@ export class SignalingRoom extends DurableObject<Env> {
   async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
     const meta: SocketMetadata = ws.deserializeAttachment() || {};
     if (meta.roomId && meta.deviceId) {
-      this.handleClientLeave(ws, meta.roomId, meta.deviceId);
+      await this.handleSocketDisconnect(ws, meta.roomId, meta.deviceId);
     }
   }
 
   async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.error('[SignalingRoom] WebSocket error:', error);
+  }
+
+  /**
+   * Storage helpers for persistence across hibernation
+   */
+  private async getRoom(code: string): Promise<RoomRecord | null> {
+    const clean = code.trim().toUpperCase();
+    let room = this.rooms.get(clean);
+    if (!room) {
+      try {
+        const stored = await this.ctx.storage.get<RoomRecord>('room:' + clean);
+        if (stored) {
+          room = stored;
+          this.rooms.set(clean, room);
+        }
+      } catch (e) {
+        console.error(`[SignalingRoom] Error reading room ${clean} from storage:`, e);
+      }
+    }
+    if (!room) return null;
+
+    const now = Date.now();
+    if (now > room.expiresAt || now - room.lastActivityAt > this.INACTIVITY_TIMEOUT_MS) {
+      await this.deleteRoom(clean);
+      return null;
+    }
+    return room;
+  }
+
+  private async saveRoom(room: RoomRecord): Promise<void> {
+    this.rooms.set(room.id, room);
+    try {
+      await this.ctx.storage.put('room:' + room.id, room);
+    } catch (e) {
+      console.error(`[SignalingRoom] Error saving room ${room.id} to storage:`, e);
+    }
+  }
+
+  private async deleteRoom(code: string): Promise<void> {
+    const clean = code.trim().toUpperCase();
+    this.rooms.delete(clean);
+    try {
+      await this.ctx.storage.delete('room:' + clean);
+    } catch (e) {
+      console.error(`[SignalingRoom] Error deleting room ${clean} from storage:`, e);
+    }
   }
 
   /**
@@ -117,14 +180,14 @@ export class SignalingRoom extends DurableObject<Env> {
           maxDevices: 2,
         };
 
-        this.rooms.set(code, room);
+        await this.saveRoom(room);
 
         meta.deviceId = device.id;
         meta.roomId = code;
         meta.deviceInfo = hostWithStatus;
         ws.serializeAttachment(meta);
 
-        console.log(`[SignalingRoom] Created room ${code} for host ${device.name}`);
+        console.log(`[SignalingRoom] Created room ${code} for host ${device.name} (${device.id})`);
 
         this.sendToSocket(ws, {
           type: 'room-created',
@@ -158,9 +221,10 @@ export class SignalingRoom extends DurableObject<Env> {
           return;
         }
 
-        const room = this.rooms.get(cleanCode);
+        const room = await this.getRoom(cleanCode);
 
         if (!room) {
+          console.log(`[SignalingRoom] Join rejected: ROOM_NOT_FOUND for code ${cleanCode}`);
           this.sendToSocket(ws, {
             type: 'error',
             requestId: message.requestId,
@@ -171,7 +235,7 @@ export class SignalingRoom extends DurableObject<Env> {
 
         const now = Date.now();
         if (now > room.expiresAt || room.status === 'expired') {
-          this.rooms.delete(cleanCode);
+          await this.deleteRoom(cleanCode);
           this.sendToSocket(ws, {
             type: 'error',
             requestId: message.requestId,
@@ -189,8 +253,12 @@ export class SignalingRoom extends DurableObject<Env> {
           return;
         }
 
-        const deviceCount = Object.keys(room.devices).length;
-        if (!room.devices[device.id] && deviceCount >= room.maxDevices) {
+        const existingDeviceIds = Object.keys(room.devices);
+        const isExistingMember = Boolean(room.devices[device.id]);
+
+        // If not already in the room, ensure room is not full
+        if (!isExistingMember && existingDeviceIds.length >= room.maxDevices) {
+          console.log(`[SignalingRoom] Join rejected: ROOM_FULL for room ${cleanCode}`);
           this.sendToSocket(ws, {
             type: 'error',
             requestId: message.requestId,
@@ -202,7 +270,7 @@ export class SignalingRoom extends DurableObject<Env> {
         const deviceWithStatus: DeviceInfo = {
           ...device,
           status: 'connected',
-          joinedAt: now,
+          joinedAt: isExistingMember ? (room.devices[device.id].joinedAt || now) : now,
         };
 
         room.devices[device.id] = deviceWithStatus;
@@ -212,12 +280,14 @@ export class SignalingRoom extends DurableObject<Env> {
           room.status = 'connected';
         }
 
+        await this.saveRoom(room);
+
         meta.deviceId = device.id;
         meta.roomId = cleanCode;
         meta.deviceInfo = deviceWithStatus;
         ws.serializeAttachment(meta);
 
-        console.log(`[SignalingRoom] Device ${device.name} joined room ${cleanCode}`);
+        console.log(`[SignalingRoom] Device ${device.name} (${device.id}) joined/reconnected to room ${cleanCode}`);
 
         // Confirm to joining device
         this.sendToSocket(ws, {
@@ -228,7 +298,7 @@ export class SignalingRoom extends DurableObject<Env> {
           },
         });
 
-        // Broadcast to other device in the room
+        // Broadcast device update to other device(s) in the room
         this.broadcastToRoom(
           cleanCode,
           {
@@ -246,7 +316,7 @@ export class SignalingRoom extends DurableObject<Env> {
       case 'leave-room': {
         const { roomId, deviceId } = message.payload || {};
         if (roomId && deviceId) {
-          this.handleClientLeave(ws, roomId, deviceId);
+          await this.handleClientLeaveExplicit(ws, roomId, deviceId);
         }
         break;
       }
@@ -255,16 +325,16 @@ export class SignalingRoom extends DurableObject<Env> {
         const { roomId, deviceId } = message.payload || {};
         if (roomId) {
           const cleanCode = roomId.trim().toUpperCase();
-          const room = this.rooms.get(cleanCode);
+          const room = await this.getRoom(cleanCode);
           if (room && room.hostDeviceId === deviceId) {
-            console.log(`[SignalingRoom] Host closed room ${cleanCode}`);
+            console.log(`[SignalingRoom] Host explicitly closed room ${cleanCode}`);
 
             this.broadcastToRoom(cleanCode, {
               type: 'room-closed',
-              payload: { roomId: cleanCode, reason: 'Room closed by host' },
+              payload: { roomId: cleanCode, reason: 'Room closed by host', reasonCode: 'user_close' },
             });
 
-            this.rooms.delete(cleanCode);
+            await this.deleteRoom(cleanCode);
           }
         }
         break;
@@ -273,6 +343,10 @@ export class SignalingRoom extends DurableObject<Env> {
       case 'webrtc-offer': {
         const { roomId, sdp, senderId, targetId } = message.payload || {};
         if (roomId && sdp) {
+          const room = this.rooms.get(roomId.trim().toUpperCase());
+          if (room) {
+            room.lastActivityAt = Date.now();
+          }
           this.broadcastToRoom(
             roomId,
             {
@@ -288,6 +362,10 @@ export class SignalingRoom extends DurableObject<Env> {
       case 'webrtc-answer': {
         const { roomId, sdp, senderId, targetId } = message.payload || {};
         if (roomId && sdp) {
+          const room = this.rooms.get(roomId.trim().toUpperCase());
+          if (room) {
+            room.lastActivityAt = Date.now();
+          }
           this.broadcastToRoom(
             roomId,
             {
@@ -303,6 +381,10 @@ export class SignalingRoom extends DurableObject<Env> {
       case 'webrtc-ice': {
         const { roomId, candidate, senderId, targetId } = message.payload || {};
         if (roomId && candidate) {
+          const room = this.rooms.get(roomId.trim().toUpperCase());
+          if (room) {
+            room.lastActivityAt = Date.now();
+          }
           this.broadcastToRoom(
             roomId,
             {
@@ -328,39 +410,72 @@ export class SignalingRoom extends DurableObject<Env> {
     }
   }
 
-  private handleClientLeave(ws: WebSocket, roomId: string, deviceId: string): void {
+  /**
+   * Handle socket disconnection without destroying the room.
+   * Device status is updated to 'disconnected', but the room remains alive in persistent storage.
+   */
+  private async handleSocketDisconnect(ws: WebSocket, roomId: string, deviceId: string): Promise<void> {
     try {
       ws.serializeAttachment({ deviceId: '', roomId: '' });
     } catch {}
 
     const cleanCode = roomId.trim().toUpperCase();
-    const room = this.rooms.get(cleanCode);
+    const room = await this.getRoom(cleanCode);
     if (!room) return;
 
-    const isHostLeft = room.hostDeviceId === deviceId;
+    if (room.devices[deviceId]) {
+      room.devices[deviceId].status = 'disconnected';
+    }
+    room.lastActivityAt = Date.now();
+
+    await this.saveRoom(room);
+    console.log(`[SignalingRoom] Device ${deviceId} socket disconnected from room ${cleanCode}. Room preserved.`);
+
+    // Inform peer of device temporary disconnect
+    this.broadcastToRoom(cleanCode, {
+      type: 'device-left',
+      payload: {
+        deviceId,
+        room: this.formatRoomForClient(room, room.hostDeviceId),
+      },
+    }, ws);
+  }
+
+  /**
+   * Handle explicit leave request from a user
+   */
+  private async handleClientLeaveExplicit(ws: WebSocket, roomId: string, deviceId: string): Promise<void> {
+    try {
+      ws.serializeAttachment({ deviceId: '', roomId: '' });
+    } catch {}
+
+    const cleanCode = roomId.trim().toUpperCase();
+    const room = await this.getRoom(cleanCode);
+    if (!room) return;
+
     delete room.devices[deviceId];
     room.lastActivityAt = Date.now();
 
     const remainingCount = Object.keys(room.devices).length;
 
-    if (isHostLeft || remainingCount === 0) {
-      this.broadcastToRoom(cleanCode, {
-        type: 'room-closed',
-        payload: { roomId: cleanCode, reason: 'Host device disconnected' },
-      });
-      this.rooms.delete(cleanCode);
-    } else {
-      if (remainingCount < 2 && room.status === 'connected') {
-        room.status = 'waiting';
-      }
-      this.broadcastToRoom(cleanCode, {
-        type: 'device-left',
-        payload: {
-          deviceId,
-          room: this.formatRoomForClient(room, room.hostDeviceId),
-        },
-      });
+    if (remainingCount === 0) {
+      await this.deleteRoom(cleanCode);
+      return;
     }
+
+    if (remainingCount < 2 && room.status === 'connected') {
+      room.status = 'waiting';
+    }
+
+    await this.saveRoom(room);
+
+    this.broadcastToRoom(cleanCode, {
+      type: 'device-left',
+      payload: {
+        deviceId,
+        room: this.formatRoomForClient(room, room.hostDeviceId),
+      },
+    });
   }
 
   private sendToSocket(ws: WebSocket, message: ServerMessage): void {
@@ -409,11 +524,15 @@ export class SignalingRoom extends DurableObject<Env> {
     };
   }
 
-  private cleanupStaleRooms(): void {
+  private async cleanupStaleRooms(): Promise<void> {
     const now = Date.now();
     for (const [code, room] of this.rooms.entries()) {
       if (now > room.expiresAt || now - room.lastActivityAt > this.INACTIVITY_TIMEOUT_MS) {
-        this.rooms.delete(code);
+        this.broadcastToRoom(code, {
+          type: 'room-expired',
+          payload: { roomId: code, reason: 'Transfer room has expired.', reasonCode: 'room_expired' },
+        });
+        await this.deleteRoom(code);
       }
     }
   }

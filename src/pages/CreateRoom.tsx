@@ -13,7 +13,7 @@ export const CreateRoom: React.FC = () => {
   const handleCreateRoom = async () => {
     const createdRoom = await createNewRoom();
     if (createdRoom) {
-      navigate(`/room/${createdRoom.id}`);
+      navigate(`/room/${createdRoom.id}`, { state: { room: createdRoom } });
     }
   };
 

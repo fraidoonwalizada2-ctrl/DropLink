@@ -45,6 +45,14 @@ export class WebRTCService {
   private activeOutgoingTransferId: string | null = null;
   private isSendingCancelled = false;
 
+  // ICE Restart and Diagnostics state
+  private isInitiator = false;
+  private iceRestartAttempts = 0;
+  private readonly MAX_ICE_RESTARTS = 2;
+  private isRestartingIce = false;
+  private selectedConnectionType: 'DIRECT' | 'STUN' | 'TURN RELAY' | null = null;
+  private receiverRestartWaitTimer: any = null;
+
   public initialize(
     roomId: string,
     localDeviceId: string,
@@ -73,32 +81,45 @@ export class WebRTCService {
     this.roomId = roomId;
     this.localDeviceId = localDeviceId;
     this.remoteDeviceId = remoteDeviceId || null;
+    this.isInitiator = isInitiator;
+    this.iceRestartAttempts = 0;
+    this.isRestartingIce = false;
+    this.selectedConnectionType = null;
+    if (this.receiverRestartWaitTimer) {
+      clearTimeout(this.receiverRestartWaitTimer);
+      this.receiverRestartWaitTimer = null;
+    }
     this.setConnectionState('connecting');
 
     const config: RTCConfiguration = {
       iceServers: getIceServers(),
+      iceTransportPolicy: 'all',
     };
 
-    console.log('[WebRTC Diagnostic] Initializing RTCPeerConnection with ICE servers:', config.iceServers);
+    console.log('[WebRTC] Initializing RTCPeerConnection with ICE servers:', config.iceServers);
     this.peerConnection = new RTCPeerConnection(config);
 
     this.peerConnection.onsignalingstatechange = () => {
-      console.log(`[WebRTC Diagnostic] Signaling state: ${this.peerConnection?.signalingState}`);
+      console.log(`[WebRTC] signalingState: ${this.peerConnection?.signalingState}`);
     };
 
     this.peerConnection.onicegatheringstatechange = () => {
-      console.log(`[WebRTC Diagnostic] ICE gathering state: ${this.peerConnection?.iceGatheringState}`);
+      console.log(`[WebRTC] iceGatheringState: ${this.peerConnection?.iceGatheringState}`);
     };
 
     this.peerConnection.onicecandidateerror = (event: any) => {
-      console.warn(`[WebRTC Diagnostic] ICE candidate error: code=${event.errorCode}, text=${event.errorText}, hostCandidate=${event.hostCandidate}, url=${event.url}`);
+      console.warn(
+        `[WebRTC] ICE candidate error: code=${event.errorCode}, text=${event.errorText}, hostCandidate=${event.hostCandidate}, url=${event.url}`
+      );
     };
 
     // Monitor connection states
     this.peerConnection.onconnectionstatechange = () => {
       const state = this.peerConnection?.connectionState;
-      console.log(`[WebRTC Diagnostic] Connection state changed: ${state}`);
+      console.log(`[WebRTC] connectionState: ${state}`);
       if (state === 'connected') {
+        this.iceRestartAttempts = 0;
+        this.logConnectionTypeDiagnostics();
         if (this.dataChannel?.readyState === 'open') {
           this.setConnectionState('connected');
         }
@@ -107,8 +128,8 @@ export class WebRTCService {
       } else if (state === 'disconnected') {
         this.setConnectionState('disconnected');
       } else if (state === 'failed') {
-        console.warn('[WebRTC Diagnostic] ConnectionState failed: Direct P2P packet exchange was blocked.');
-        this.setConnectionState('failed');
+        console.warn('[WebRTC] connectionState failed. Initiating failure handling / ICE restart...');
+        this.handleIceFailure();
       } else if (state === 'closed') {
         this.setConnectionState('closed');
       }
@@ -116,14 +137,16 @@ export class WebRTCService {
 
     this.peerConnection.oniceconnectionstatechange = () => {
       const iceState = this.peerConnection?.iceConnectionState;
-      console.log(`[WebRTC Diagnostic] ICE connection state: ${iceState}`);
+      console.log(`[WebRTC] iceConnectionState: ${iceState}`);
       if (iceState === 'connected' || iceState === 'completed') {
+        this.iceRestartAttempts = 0;
+        this.logConnectionTypeDiagnostics();
         if (this.dataChannel?.readyState === 'open') {
           this.setConnectionState('connected');
         }
       } else if (iceState === 'failed') {
-        console.warn('[WebRTC Diagnostic] Signaling works, but ICE connectivity failed. NAT/firewall conditions (Symmetric NAT / Carrier Grade NAT) prevent direct UDP connectivity without a TURN relay server.');
-        this.setConnectionState('failed');
+        console.warn('[WebRTC] iceConnectionState failed. Initiating failure handling / ICE restart...');
+        this.handleIceFailure();
       }
     };
 
@@ -131,7 +154,9 @@ export class WebRTCService {
     this.peerConnection.onicecandidate = (event) => {
       if (event.candidate && this.roomId && this.localDeviceId) {
         const cand = event.candidate;
-        console.log(`[WebRTC Diagnostic] Local ICE Candidate generated: type=${cand.type}, protocol=${cand.protocol}, address=${cand.address || 'hidden'}, port=${cand.port}`);
+        console.log(
+          `[WebRTC] Local ICE candidate generated: type=${cand.type}, protocol=${cand.protocol}, address=${cand.address || 'hidden'}, port=${cand.port}`
+        );
         signalingService.sendIceCandidate(
           this.roomId,
           cand.toJSON(),
@@ -139,7 +164,7 @@ export class WebRTCService {
           this.remoteDeviceId || undefined
         );
       } else if (!event.candidate) {
-        console.log('[WebRTC Diagnostic] Local ICE Gathering Complete.');
+        console.log('[WebRTC] Local ICE gathering complete.');
       }
     };
 
@@ -246,12 +271,18 @@ export class WebRTCService {
     remoteSenderId: string,
     roomId?: string
   ): Promise<void> {
-    console.log(`[WebRTC Diagnostic] Received SDP offer from ${remoteSenderId} (SDP length: ${offer.sdp?.length || 0})`);
+    console.log(`[WebRTC] Received SDP offer from ${remoteSenderId} (SDP length: ${offer.sdp?.length || 0})`);
     this.remoteDeviceId = remoteSenderId;
     if (roomId) this.roomId = roomId;
 
+    if (this.receiverRestartWaitTimer) {
+      clearTimeout(this.receiverRestartWaitTimer);
+      this.receiverRestartWaitTimer = null;
+    }
+    this.isRestartingIce = false;
+
     if (!this.peerConnection) {
-      console.log('[WebRTC Diagnostic] PeerConnection not yet initialized when offer arrived. Staging offer and initializing as receiver now...');
+      console.log('[WebRTC] PeerConnection not yet initialized when offer arrived. Staging offer and initializing as receiver now...');
       this.pendingOffer = { offer, senderId: remoteSenderId, roomId };
       const localId = this.localDeviceId || getLocalDeviceInfo().id;
       this.initialize(roomId || this.roomId || '', localId, false, remoteSenderId);
@@ -259,18 +290,18 @@ export class WebRTCService {
     }
 
     try {
-      console.log('[WebRTC Diagnostic] Setting remote description (offer)...');
+      console.log('[WebRTC] Setting remote description (offer)...');
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
-      console.log(`[WebRTC Diagnostic] Remote description set. SignalingState: ${this.peerConnection.signalingState}`);
+      console.log(`[WebRTC] Remote description set. SignalingState: ${this.peerConnection.signalingState}`);
       await this.flushPendingIceCandidates();
 
-      console.log('[WebRTC Diagnostic] Creating SDP answer...');
+      console.log('[WebRTC] Creating SDP answer...');
       const answer = await this.peerConnection.createAnswer();
       await this.peerConnection.setLocalDescription(answer);
-      console.log(`[WebRTC Diagnostic] Set local description (answer). SignalingState: ${this.peerConnection.signalingState}`);
+      console.log(`[WebRTC] Set local description (answer). SignalingState: ${this.peerConnection.signalingState}`);
 
       if (this.roomId && this.localDeviceId) {
-        console.log(`[WebRTC Diagnostic] Sending SDP answer back to host ${this.remoteDeviceId} via signaling...`);
+        console.log(`[WebRTC] Sending SDP answer back to host ${this.remoteDeviceId} via signaling...`);
         signalingService.sendAnswer(
           this.roomId,
           answer,
@@ -279,26 +310,27 @@ export class WebRTCService {
         );
       }
     } catch (err) {
-      console.error('[WebRTC Diagnostic] Failed handling offer:', err);
-      this.setConnectionState('failed');
+      console.error('[WebRTC] Failed handling offer:', err);
+      this.handleIceFailure();
     }
   }
 
   public async handleAnswer(answer: RTCSessionDescriptionInit): Promise<void> {
-    console.log(`[WebRTC Diagnostic] Received SDP answer (SDP length: ${answer.sdp?.length || 0})`);
+    console.log(`[WebRTC] Received SDP answer (SDP length: ${answer.sdp?.length || 0})`);
+    this.isRestartingIce = false;
     if (!this.peerConnection) {
-      console.warn('[WebRTC Diagnostic] Received answer but PeerConnection is null!');
+      console.warn('[WebRTC] Received answer but PeerConnection is null!');
       return;
     }
 
     try {
-      console.log('[WebRTC Diagnostic] Setting remote description (answer)...');
+      console.log('[WebRTC] Setting remote description (answer)...');
       await this.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
-      console.log(`[WebRTC Diagnostic] Remote description (answer) set successfully. SignalingState: ${this.peerConnection.signalingState}`);
+      console.log(`[WebRTC] Remote description (answer) set successfully. SignalingState: ${this.peerConnection.signalingState}`);
       await this.flushPendingIceCandidates();
     } catch (err) {
-      console.error('[WebRTC Diagnostic] Failed handling answer:', err);
-      this.setConnectionState('failed');
+      console.error('[WebRTC] Failed handling answer:', err);
+      this.handleIceFailure();
     }
   }
 
@@ -577,6 +609,10 @@ export class WebRTCService {
       clearTimeout(this.offerRetryTimer);
       this.offerRetryTimer = null;
     }
+    if (this.receiverRestartWaitTimer) {
+      clearTimeout(this.receiverRestartWaitTimer);
+      this.receiverRestartWaitTimer = null;
+    }
     if (this.dataChannel) {
       this.dataChannel.close();
       this.dataChannel = null;
@@ -586,6 +622,9 @@ export class WebRTCService {
       this.peerConnection = null;
     }
     this.setConnectionState('idle');
+    this.iceRestartAttempts = 0;
+    this.isRestartingIce = false;
+    this.selectedConnectionType = null;
     this.pendingIceCandidates = [];
     this.pendingOffer = null;
     this.currentIncomingMeta = null;
@@ -604,6 +643,139 @@ export class WebRTCService {
 
   public isP2PConnected(): boolean {
     return this.connectionState === 'connected' && this.dataChannel?.readyState === 'open';
+  }
+
+  public getSelectedConnectionType(): 'DIRECT' | 'STUN' | 'TURN RELAY' | null {
+    return this.selectedConnectionType;
+  }
+
+  private async handleIceFailure(): Promise<void> {
+    if (this.isRestartingIce) return;
+
+    if (this.iceRestartAttempts < this.MAX_ICE_RESTARTS) {
+      this.iceRestartAttempts++;
+      console.log(
+        `[WebRTC] Connection failed. Attempting ICE restart (${this.iceRestartAttempts}/${this.MAX_ICE_RESTARTS})...`
+      );
+
+      this.isRestartingIce = true;
+
+      if (this.isInitiator && this.peerConnection) {
+        try {
+          this.peerConnection.restartIce();
+          await this.createAndSendOffer();
+        } catch (err) {
+          console.error('[WebRTC] Error during ICE restart offer:', err);
+        } finally {
+          setTimeout(() => {
+            this.isRestartingIce = false;
+          }, 3000);
+        }
+      } else {
+        // As receiver, await restarted offer from initiator
+        this.setConnectionState('connecting');
+        if (this.receiverRestartWaitTimer) clearTimeout(this.receiverRestartWaitTimer);
+        this.receiverRestartWaitTimer = setTimeout(() => {
+          this.isRestartingIce = false;
+          if (
+            this.peerConnection?.iceConnectionState === 'failed' ||
+            this.peerConnection?.connectionState === 'failed'
+          ) {
+            this.handleIceFailure();
+          }
+        }, 5000);
+      }
+      return;
+    }
+
+    console.warn(
+      `[WebRTC] Maximum ICE restart attempts (${this.MAX_ICE_RESTARTS}) exhausted. Could not establish a direct connection. Please check your network or try again.`
+    );
+    this.setConnectionState('failed');
+    this.emit('connection-failed', {
+      message: 'Could not establish a direct connection. Please check your network or try again.',
+    });
+  }
+
+  public async logConnectionTypeDiagnostics(): Promise<void> {
+    if (!this.peerConnection) return;
+
+    try {
+      const stats = await this.peerConnection.getStats();
+      let selectedPair: any = null;
+
+      // In standard WebRTC spec, transport report contains selectedCandidatePairId
+      stats.forEach((report) => {
+        if (report.type === 'transport' && report.selectedCandidatePairId) {
+          selectedPair = stats.get(report.selectedCandidatePairId);
+        }
+      });
+
+      // Fallback: check candidate-pair where selected === true or (nominated === true && state === 'succeeded')
+      if (!selectedPair) {
+        stats.forEach((report) => {
+          if (
+            report.type === 'candidate-pair' &&
+            (report.selected || (report.nominated && report.state === 'succeeded'))
+          ) {
+            selectedPair = report;
+          }
+        });
+      }
+
+      if (selectedPair) {
+        const localCandidate = stats.get(selectedPair.localCandidateId);
+        const remoteCandidate = stats.get(selectedPair.remoteCandidateId);
+
+        const localType: string = (
+          localCandidate?.candidateType ||
+          localCandidate?.type ||
+          'unknown'
+        ).toLowerCase();
+        const remoteType: string = (
+          remoteCandidate?.candidateType ||
+          remoteCandidate?.type ||
+          'unknown'
+        ).toLowerCase();
+        const protocol: string = (
+          localCandidate?.protocol ||
+          remoteCandidate?.protocol ||
+          'udp'
+        ).toUpperCase();
+
+        let connectionType: 'DIRECT' | 'STUN' | 'TURN RELAY' = 'DIRECT';
+        if (localType === 'relay' || remoteType === 'relay') {
+          connectionType = 'TURN RELAY';
+        } else if (
+          localType === 'srflx' ||
+          remoteType === 'srflx' ||
+          localType === 'prflx' ||
+          remoteType === 'prflx'
+        ) {
+          connectionType = 'STUN';
+        } else if (localType === 'host' && remoteType === 'host') {
+          connectionType = 'DIRECT';
+        }
+
+        this.selectedConnectionType = connectionType;
+
+        console.log(`=========================================`);
+        console.log(`[WebRTC] Connection type: ${connectionType}`);
+        console.log(
+          `[WebRTC] Candidate Pair: Local=${localType} (${localCandidate?.address || 'local'}:${localCandidate?.port}) | Remote=${remoteType} (${remoteCandidate?.address || 'remote'}:${remoteCandidate?.port}) | Protocol=${protocol}`
+        );
+        console.log(`=========================================`);
+
+        this.emit('connection-type-detected', {
+          connectionType,
+          localType,
+          remoteType,
+          protocol,
+        });
+      }
+    } catch (err) {
+      console.warn('[WebRTC] Unable to inspect ICE candidate pair stats:', err);
+    }
   }
 
   public on(event: string, callback: WebRTCEventCallback): void {
